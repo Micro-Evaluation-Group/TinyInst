@@ -28,6 +28,10 @@ aligns to 16k to ensure that not only parts of a module is instrumented. This
 behavior is controlled by the `-page_extend_modules` flag which is set to
 `true` by default on M1. In some cases it might be possible to turn off this flag resulting in better performance.
 
+## Running against arm64e binaries
+
+See [here](https://github.com/googleprojectzero/TinyInst/blob/master/macOS/arm64e.md)
+
 ## TinyInst and Guard Malloc
 
 On macOS, [Guard Malloc](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/ManagingMemory/Articles/MallocDebug.html) is a special version of the malloc library that makes it easier to catch certain types of memory safety issues. To enable Guard Malloc for a target process running under TinyInst, use the following flag:
@@ -47,3 +51,4 @@ An issue was observed with some targets, where the combination of TinyInst and G
 The first part ensures that the instrumented module will be loaded before libgmalloc (the order of libraries in `DYLD_INSERT_LIBRARIES` is important). The `-instrument_modules_on_load` flag ensures that modules will be instrumented as soon as they are loaded (and not when the process entypoint or the target method is reached, as is normally the case in TinyInst.
 
 Additionally, especially if you enconter errors related to stack unwinding, the `-patch_return_addresses` flag might be needed.
+
