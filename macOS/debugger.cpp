@@ -861,6 +861,17 @@ void Debugger::ExtractCodeRanges(void *base_address,
       if (strcmp(segment_cmd->segname, "__TEXT") == 0) {
         mach_vm_address_t segment_start_addr = (mach_vm_address_t)segment_cmd->vmaddr + file_vm_slide;
         mach_vm_address_t segment_end_addr = (mach_vm_address_t)segment_cmd->vmaddr + file_vm_slide + segment_cmd->vmsize;
+
+        // Clip to min/max_address if they constrain to a sub-range of __TEXT.
+        // This enables partial module instrumentation via -instrument_ranges_file.
+        // Page-align the clipped range to 16KB (ARM64 page size).
+        if (min_address > segment_start_addr && min_address < segment_end_addr) {
+          segment_start_addr = min_address & ~(mach_vm_address_t)0x3FFF; // align down to 16KB
+        }
+        if (max_address > segment_start_addr && max_address < segment_end_addr) {
+          segment_end_addr = (max_address + 0x3FFF) & ~(mach_vm_address_t)0x3FFF; // align up to 16KB
+        }
+
         AddressRange arm_ar;
         arm_ar.from = segment_start_addr;
         arm_ar.to = segment_end_addr;
@@ -869,7 +880,7 @@ void Debugger::ExtractCodeRanges(void *base_address,
         RemoteRead((void*)arm_ar.from, arm_ar.data, range_size);
 
         ExtractSegmentCodeRanges(segment_start_addr, segment_end_addr, executable_ranges, code_size);
-        for(const auto& er: *executable_ranges) { 
+        for(const auto& er: *executable_ranges) {
           free(er.data);
         }
         executable_ranges->clear();

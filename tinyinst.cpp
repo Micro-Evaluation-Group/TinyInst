@@ -17,9 +17,13 @@ limitations under the License.
 #define  _CRT_SECURE_NO_WARNINGS
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <inttypes.h>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #include <list>
 
@@ -539,8 +543,10 @@ void TinyInst::TranslateBasicBlock(char *address,
 
   AddressRange *range = GetRegion(module, (size_t)address);
   if (!range) {
-    // just insert a jump to address
-    assembler_->JmpAddress(module, (size_t)address);
+    // Address is within [min_address, max_address] but not in any
+    // executable_range. This happens with multi-range configs where
+    // gap code between ranges gets referenced. Treat as outside jump.
+    OutsideJump(module, (size_t)address);
     return;
   }
 
@@ -914,12 +920,61 @@ void TinyInst::InstrumentModule(ModuleInfo *module) {
     return;
   }
   
-  ExtractCodeRanges(module->module_header,
-                    module->min_address,
-                    module->max_address,
-                    &module->executable_ranges,
-                    &module->code_size,
-                    module->do_protect);
+  // Check if this module has a multi-range config (disjoint ranges).
+  // If so, extract code ranges individually for each configured range
+  // instead of using the bounding box. This avoids instrumenting gap
+  // code between disjoint ranges, giving better signal-to-noise and
+  // smaller instrumented code buffers.
+  const ModuleRangeConfig *range_cfg = nullptr;
+  for (const auto &cfg : module_range_configs) {
+    if (_stricmp(module->module_name.c_str(), cfg.module_name.c_str()) == 0 &&
+        cfg.ranges.size() > 1) {
+      range_cfg = &cfg;
+      break;
+    }
+  }
+
+  if (range_cfg) {
+    // Multi-range extraction: call ExtractCodeRanges per configured range.
+    // min_address/max_address remain the bounding box (needed for basic_blocks
+    // offset math and GetModule fast path). executable_ranges will contain
+    // only the specified disjoint ranges.
+    size_t base = (size_t)module->module_header;
+    module->code_size = 0;
+    for (auto &it : module->executable_ranges) {
+      free(it.data);
+    }
+    module->executable_ranges.clear();
+
+    for (const auto &r : range_cfg->ranges) {
+      size_t abs_start = base + r.offset_start;
+      size_t abs_end = base + r.offset_end;
+      std::list<AddressRange> sub_ranges;
+      size_t sub_code_size = 0;
+      ExtractCodeRanges(module->module_header,
+                        abs_start,
+                        abs_end,
+                        &sub_ranges,
+                        &sub_code_size,
+                        module->do_protect);
+      module->code_size += sub_code_size;
+      for (auto &sr : sub_ranges) {
+        module->executable_ranges.push_back(sr);
+      }
+    }
+    SAY("Multi-range extraction for %s: %zu ranges, total code_size %zu KB\n",
+        module->module_name.c_str(),
+        module->executable_ranges.size(),
+        module->code_size / 1024);
+  } else {
+    // Single range or no range config: use bounding box (original behavior).
+    ExtractCodeRanges(module->module_header,
+                      module->min_address,
+                      module->max_address,
+                      &module->executable_ranges,
+                      &module->code_size,
+                      module->do_protect);
+  }
 
   // allocate buffer for instrumented code
   module->instrumented_code_size = module->code_size * CODE_SIZE_MULTIPLIER;
@@ -1089,6 +1144,35 @@ void TinyInst::OnInstrumentModuleLoaded(void *module, ModuleInfo *target_module)
   GetImageSize(target_module->module_header,
                &target_module->min_address,
                &target_module->max_address);
+
+  // Override address range if a ranges config is loaded for this module.
+  // Uses the bounding box of all configured ranges so TinyInst allocates
+  // instrumented code for the full span, then only executable_ranges
+  // within that span will actually be instrumented.
+  for (const auto &cfg : module_range_configs) {
+    if (_stricmp(target_module->module_name.c_str(), cfg.module_name.c_str()) == 0) {
+      // Use module_header (Mach-O header address) as the base, not min_address.
+      // For shared cache dylibs, min_address may include non-__TEXT segments
+      // at lower addresses. Offsets in the config are relative to the image base.
+      size_t base = (size_t)target_module->module_header;
+      size_t range_min = (size_t)-1;
+      size_t range_max = 0;
+      for (const auto &r : cfg.ranges) {
+        size_t abs_start = base + r.offset_start;
+        size_t abs_end = base + r.offset_end;
+        if (abs_start < range_min) range_min = abs_start;
+        if (abs_end > range_max) range_max = abs_end;
+      }
+      SAY("Applying range config for %s: 0x%zx - 0x%zx (was 0x%zx - 0x%zx)\n",
+          target_module->module_name.c_str(),
+          range_min, range_max,
+          target_module->min_address, target_module->max_address);
+      target_module->min_address = range_min;
+      target_module->max_address = range_max;
+      break;
+    }
+  }
+
   target_module->loaded = true;
 
   if(instrument_modules_on_load) {
@@ -1235,6 +1319,151 @@ void TinyInst::AddInstrumentedModule(char* name, bool do_protect) {
   instrumented_modules.push_back(new_module);
 }
 
+// Minimal JSON parser for instrument_ranges_file config.
+// Supports the schema:
+// {
+//   "modules": [
+//     {
+//       "name": "module.dylib",
+//       "ranges": [
+//         { "offset_start": "0x1234", "offset_end": "0x5678" }
+//       ]
+//     }
+//   ]
+// }
+static std::string json_trim(const std::string &s) {
+  size_t start = s.find_first_not_of(" \t\n\r");
+  if (start == std::string::npos) return "";
+  size_t end = s.find_last_not_of(" \t\n\r");
+  return s.substr(start, end - start + 1);
+}
+
+static std::string json_extract_string(const std::string &s, const std::string &key) {
+  std::string search = "\"" + key + "\"";
+  size_t pos = s.find(search);
+  if (pos == std::string::npos) return "";
+  pos = s.find(':', pos + search.size());
+  if (pos == std::string::npos) return "";
+  pos = s.find('"', pos + 1);
+  if (pos == std::string::npos) return "";
+  size_t end = s.find('"', pos + 1);
+  if (end == std::string::npos) return "";
+  return s.substr(pos + 1, end - pos - 1);
+}
+
+void TinyInst::LoadRangesConfig(const char *filename) {
+  std::ifstream file(filename);
+  if (!file.is_open()) {
+    FATAL("Failed to open instrument_ranges_file: %s", filename);
+  }
+
+  std::stringstream ss;
+  ss << file.rdbuf();
+  std::string content = ss.str();
+
+  // Find "modules" array
+  size_t modules_pos = content.find("\"modules\"");
+  if (modules_pos == std::string::npos) {
+    FATAL("instrument_ranges_file missing \"modules\" key");
+  }
+
+  size_t arr_start = content.find('[', modules_pos);
+  if (arr_start == std::string::npos) {
+    FATAL("instrument_ranges_file: malformed modules array");
+  }
+
+  // Find matching closing bracket for modules array
+  int depth = 1;
+  size_t arr_end = arr_start + 1;
+  while (arr_end < content.size() && depth > 0) {
+    if (content[arr_end] == '[') depth++;
+    else if (content[arr_end] == ']') depth--;
+    arr_end++;
+  }
+
+  // Parse each module object
+  size_t pos = arr_start + 1;
+  while (pos < arr_end) {
+    size_t obj_start = content.find('{', pos);
+    if (obj_start == std::string::npos || obj_start >= arr_end) break;
+
+    // Find matching closing brace
+    int obj_depth = 1;
+    size_t obj_end = obj_start + 1;
+    while (obj_end < content.size() && obj_depth > 0) {
+      if (content[obj_end] == '{') obj_depth++;
+      else if (content[obj_end] == '}') obj_depth--;
+      obj_end++;
+    }
+
+    std::string module_obj = content.substr(obj_start, obj_end - obj_start);
+    std::string name = json_extract_string(module_obj, "name");
+    if (name.empty()) {
+      FATAL("instrument_ranges_file: module missing \"name\"");
+    }
+
+    ModuleRangeConfig config;
+    config.module_name = name;
+
+    // Find "ranges" array within this module object
+    size_t ranges_pos = module_obj.find("\"ranges\"");
+    if (ranges_pos != std::string::npos) {
+      size_t r_arr_start = module_obj.find('[', ranges_pos);
+      size_t r_arr_end = module_obj.find(']', r_arr_start);
+      if (r_arr_start != std::string::npos && r_arr_end != std::string::npos) {
+        // Parse each range object
+        size_t r_pos = r_arr_start + 1;
+        while (r_pos < r_arr_end) {
+          size_t r_obj_start = module_obj.find('{', r_pos);
+          if (r_obj_start == std::string::npos || r_obj_start >= r_arr_end) break;
+          size_t r_obj_end = module_obj.find('}', r_obj_start);
+          if (r_obj_end == std::string::npos) break;
+
+          std::string range_obj = module_obj.substr(r_obj_start,
+                                                    r_obj_end - r_obj_start + 1);
+          std::string start_str = json_extract_string(range_obj, "offset_start");
+          std::string end_str = json_extract_string(range_obj, "offset_end");
+
+          if (start_str.empty() || end_str.empty()) {
+            FATAL("instrument_ranges_file: range missing offset_start or offset_end");
+          }
+
+          ModuleRangeConfig::Range range;
+          range.offset_start = strtoull(start_str.c_str(), NULL, 0);
+          range.offset_end = strtoull(end_str.c_str(), NULL, 0);
+
+          if (range.offset_end <= range.offset_start) {
+            FATAL("instrument_ranges_file: offset_end must be > offset_start "
+                  "(got 0x%zx - 0x%zx)", range.offset_start, range.offset_end);
+          }
+
+          config.ranges.push_back(range);
+          r_pos = r_obj_end + 1;
+        }
+      }
+    }
+
+    if (config.ranges.empty()) {
+      FATAL("instrument_ranges_file: module \"%s\" has no ranges", name.c_str());
+    }
+
+    SAY("Loaded range config for %s: %zu range(s)\n",
+        config.module_name.c_str(), config.ranges.size());
+    for (const auto &r : config.ranges) {
+      SAY("  +0x%zx - +0x%zx (%zu KB)\n",
+          r.offset_start, r.offset_end,
+          (r.offset_end - r.offset_start) / 1024);
+    }
+
+    module_range_configs.push_back(config);
+    pos = obj_end;
+  }
+
+  if (module_range_configs.empty()) {
+    FATAL("instrument_ranges_file: no module configurations found");
+  }
+}
+
 // initializes instrumentation from command line options
 void TinyInst::Init(int argc, char **argv) {
   // init the debugger first
@@ -1329,6 +1558,27 @@ void TinyInst::Init(int argc, char **argv) {
   for (const auto module_name: module_names_transitive) {
     AddInstrumentedModule(module_name, false);
     // SAY("--- %s\n", module_name);
+  }
+
+  // Parse -instrument_ranges_file for partial module instrumentation
+  char *ranges_file = GetOption("-instrument_ranges_file", argc, argv);
+  if (ranges_file) {
+    LoadRangesConfig(ranges_file);
+    // Register each configured module if not already registered
+    for (const auto &cfg : module_range_configs) {
+      bool already_registered = false;
+      for (auto *mod : instrumented_modules) {
+        if (_stricmp(mod->module_name.c_str(), cfg.module_name.c_str()) == 0) {
+          already_registered = true;
+          break;
+        }
+      }
+      if (!already_registered) {
+        // Use strdup so the string persists
+        char *name_copy = strdup(cfg.module_name.c_str());
+        AddInstrumentedModule(name_copy, true);
+      }
+    }
   }
 
   char *option;

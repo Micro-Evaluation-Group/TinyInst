@@ -20,6 +20,8 @@ limitations under the License.
 #include <list>
 #include <set>
 #include <map>
+#include <string>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -164,6 +166,19 @@ protected:
   
   void InstrumentAddressRange(const char *name, size_t min_address, size_t max_address);
 
+  // Per-module address range configuration loaded from JSON file.
+  // Offsets are relative to the module's loaded base address.
+  struct ModuleRangeConfig {
+    std::string module_name;
+    struct Range {
+      size_t offset_start;
+      size_t offset_end;
+    };
+    std::vector<Range> ranges;
+  };
+
+  void LoadRangesConfig(const char *filename);
+
 private:
   void AddInstrumentedModule(char* name, bool do_protect);
   bool HandleBreakpoint(void *address);
@@ -252,8 +267,11 @@ private:
 
   bool instrumentation_disabled;
   bool instrument_modules_on_load;
-  
+
   bool full_address_map;
+
+  // Module address range configs loaded from JSON via -instrument_ranges_file
+  std::vector<ModuleRangeConfig> module_range_configs;
 
   PatchModuleEntriesValue patch_module_entries;
 
