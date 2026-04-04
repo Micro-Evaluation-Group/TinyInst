@@ -817,7 +817,21 @@ size_t TinyInst::GetTranslatedAddress(size_t address) {
 bool TinyInst::TryExecuteInstrumented(char *address) {
   ModuleInfo *module = GetModule((size_t)address);
 
-  if (!module) return false;
+  if (!module) {
+    // Address not in any executable_range but may be on a shared protected
+    // page (Windows 4KB page granularity). If the address falls within a
+    // module with a range config, restore execute permission for just that
+    // page so the code can run natively.
+    for (auto *m : instrumented_modules) {
+      if (!m->loaded || !m->instrumented) continue;
+      if ((size_t)address < m->min_address || (size_t)address >= m->max_address) continue;
+      if (!module_range_configs.empty()) {
+        RestorePagePermissions((void *)address);
+        return true;  // re-execute at the same address natively
+      }
+    }
+    return false;
+  }
   if (!GetRegion(module, (size_t)address)) return false;
 
   if (trace_module_entries) {
@@ -946,6 +960,9 @@ void TinyInst::InstrumentModule(ModuleInfo *module) {
     }
     module->executable_ranges.clear();
 
+    // Extract without protecting first — on Windows, page-granular protection
+    // from the first range would make subsequent ranges on the same page
+    // appear non-executable. Protect the full bounding box afterward.
     for (const auto &r : range_cfg->ranges) {
       size_t abs_start = base + r.offset_start;
       size_t abs_end = base + r.offset_end;
@@ -956,10 +973,26 @@ void TinyInst::InstrumentModule(ModuleInfo *module) {
                         abs_end,
                         &sub_ranges,
                         &sub_code_size,
-                        module->do_protect);
+                        false);
       module->code_size += sub_code_size;
       for (auto &sr : sub_ranges) {
         module->executable_ranges.push_back(sr);
+      }
+    }
+    // Now protect the full bounding box in one pass. We call ExtractCodeRanges
+    // again with do_protect=true; its extracted ranges are discarded — we only
+    // want the side-effect of removing execute permission from the pages.
+    if (module->do_protect) {
+      std::list<AddressRange> discard_ranges;
+      size_t discard_size = 0;
+      ExtractCodeRanges(module->module_header,
+                        module->min_address,
+                        module->max_address,
+                        &discard_ranges,
+                        &discard_size,
+                        true);
+      for (auto &dr : discard_ranges) {
+        free(dr.data);
       }
     }
     SAY("Multi-range extraction for %s: %zu ranges, total code_size %zu KB\n",
@@ -1163,6 +1196,19 @@ void TinyInst::OnInstrumentModuleLoaded(void *module, ModuleInfo *target_module)
         if (abs_start < range_min) range_min = abs_start;
         if (abs_end > range_max) range_max = abs_end;
       }
+      // Page-align the bounding box outward. VirtualProtectEx operates at
+      // page granularity, so min/max_address must cover full pages. This
+      // ensures code on boundary pages (but outside configured ranges) is
+      // caught by the RestorePagePermissions path in TryExecuteInstrumented.
+#ifndef ARM64
+      range_min = range_min & ~(size_t)0xFFF;                    // align down to 4KB
+      range_max = (range_max + 0xFFF) & ~(size_t)0xFFF;          // align up to 4KB
+      // Clamp to the original image bounds
+      if (range_min < (size_t)target_module->min_address)
+        range_min = (size_t)target_module->min_address;
+      if (range_max > (size_t)target_module->max_address)
+        range_max = (size_t)target_module->max_address;
+#endif
       SAY("Applying range config for %s: 0x%zx - 0x%zx (was 0x%zx - 0x%zx)\n",
           target_module->module_name.c_str(),
           range_min, range_max,

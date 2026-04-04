@@ -192,6 +192,30 @@ In addition to the general-purpose API documented above, TinyInst also implement
 
 `-generate_unwind` - Generates stack unwinding data for instrumented code (for faster C++ exception handling). Note that it might not work correctly on some older Windows versions.
 
+`-instrument_ranges_file [path]` specifies a JSON file containing per-module address ranges to instrument. Only code within the configured ranges will be instrumented; the rest of the module runs natively. This is useful for targeting specific functions or code regions without instrumenting the entire module. Modules listed in the file are automatically registered for instrumentation (no separate `-instrument_module` needed). When a module has multiple disjoint ranges, TinyInst extracts code for each range individually, avoiding instrumentation of gap code between them.
+
+The JSON file uses the following schema:
+
+```json
+{
+  "modules": [
+    {
+      "name": "target.dll",
+      "ranges": [
+        { "offset_start": "0x1000", "offset_end": "0x5000" },
+        { "offset_start": "0x8000", "offset_end": "0xA000" }
+      ]
+    }
+  ]
+}
+```
+
+- `name` is the module filename (matched case-insensitively).
+- `offset_start` and `offset_end` are hex or decimal offsets relative to the module's load base address.
+- Multiple modules can be specified in the `modules` array.
+
+Note: On Windows (x86/x64), memory protection operates at 4KB page granularity. Ranges that share a page with non-instrumented entry points (e.g. CRT startup code) may have reduced coverage on that shared page. For best results, use page-aligned range boundaries.
+
 `-persist_instrumentation_data` (default = true) Does not reinstrument module on module unloads / reloads. Only works if the module is loaded on the same address it was loaded before.
 
 `-instrument_cross_module_calls` (default=true) If multiple `-instrument_module` modules are specified and one calls into another, jump to instrumented code of the other module without causing an exception (which would cause slowdowns).

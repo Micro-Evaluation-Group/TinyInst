@@ -580,17 +580,28 @@ void Debugger::ExtractCodeRanges(void *module_base,
     if (meminfobuf.Protect & 0xF0) {
       // printf("%p, %llx, %lx\n", meminfobuf.BaseAddress, meminfobuf.RegionSize, meminfobuf.Protect);
 
+      // Clip the region to [min_address, max_address]. This is needed for
+      // partial module instrumentation via -instrument_ranges_file where
+      // min/max constrain to a sub-range of the module.
+      size_t region_from = (size_t)meminfobuf.BaseAddress;
+      size_t region_to = region_from + meminfobuf.RegionSize;
+      if (region_from < min_address) region_from = min_address;
+      if (region_to > max_address) region_to = max_address;
+      if (region_from >= region_to) goto next_region;
+
+      size_t clip_size = region_to - region_from;
+
       SIZE_T size_read;
-      newRange.data = (char *)malloc(meminfobuf.RegionSize);
+      newRange.data = (char *)malloc(clip_size);
       if (!ReadProcessMemory(child_handle,
-        meminfobuf.BaseAddress,
+        (LPCVOID)region_from,
         newRange.data,
-        meminfobuf.RegionSize,
+        clip_size,
         &size_read))
       {
         FATAL("Error in ReadProcessMemory");
       }
-      if (size_read != meminfobuf.RegionSize) {
+      if (size_read != clip_size) {
         FATAL("Error in ReadProcessMemory");
       }
 
@@ -599,9 +610,13 @@ void Debugger::ExtractCodeRanges(void *module_base,
         low = low >> 4;
         DWORD newProtect = (meminfobuf.Protect & 0xFFFFFF00) + low;
         DWORD oldProtect;
+        // Protect only the clipped range, not the full region. This is
+        // critical for -instrument_ranges_file: the full region may span
+        // the entire .text section, but we must only remove execute
+        // permission from the pages we're actually instrumenting.
         if (!VirtualProtectEx(child_handle,
-                              meminfobuf.BaseAddress,
-                              meminfobuf.RegionSize,
+                              (LPVOID)region_from,
+                              clip_size,
                               newProtect,
                               &oldProtect))
         {
@@ -609,15 +624,43 @@ void Debugger::ExtractCodeRanges(void *module_base,
         }
       }
 
-      newRange.from = (size_t)meminfobuf.BaseAddress;
-      newRange.to = (size_t)meminfobuf.BaseAddress + meminfobuf.RegionSize;
+      newRange.from = region_from;
+      newRange.to = region_to;
       executable_ranges->push_back(newRange);
 
       *code_size += newRange.to - newRange.from;
     }
 
+next_region:
     cur_address = (char *)meminfobuf.BaseAddress + meminfobuf.RegionSize;
   }
+}
+
+// Restores execute permission for the single page containing the given
+// address. Used by -instrument_ranges_file when code outside configured
+// ranges but on a shared protected page needs to run natively.
+void Debugger::RestorePagePermissions(void *address) {
+  MEMORY_BASIC_INFORMATION meminfobuf;
+  size_t ret = VirtualQueryEx(child_handle,
+    address,
+    &meminfobuf,
+    sizeof(MEMORY_BASIC_INFORMATION));
+  if (!ret) return;
+
+  // Restore execute permission: shift protection nibble back up
+  uint8_t low = meminfobuf.Protect & 0xFF;
+  if (low & 0xF0) return;  // already executable
+  DWORD newProtect = (meminfobuf.Protect & 0xFFFFFF00) + (low << 4);
+  DWORD oldProtect;
+  // Only restore the single 4KB page containing the address, not the
+  // entire region. This preserves protection on adjacent pages that
+  // may contain instrumented code ranges.
+  size_t page_start = (size_t)address & ~(size_t)0xFFF;
+  VirtualProtectEx(child_handle,
+                   (LPVOID)page_start,
+                   0x1000,
+                   newProtect,
+                   &oldProtect);
 }
 
 // sets all pages containing (previously detected)

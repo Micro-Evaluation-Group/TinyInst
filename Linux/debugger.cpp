@@ -1582,6 +1582,10 @@ void Debugger::ProtectCodeRanges(std::list<AddressRange> *executable_ranges) {
   }
 }
 
+void Debugger::RestorePagePermissions(void *address) {
+  // Stub for Linux — partial range instrumentation page restoration not yet needed.
+}
+
 void Debugger::PatchPointersRemote(void *base_address, std::unordered_map<size_t, size_t>& search_replace) {
   std::string elf_filename;
   GetModuleFilename(base_address, &elf_filename);
