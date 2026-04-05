@@ -663,6 +663,20 @@ void Debugger::RestorePagePermissions(void *address) {
                    &oldProtect);
 }
 
+void Debugger::RemoveExecutePermission(size_t address, size_t size) {
+  MEMORY_BASIC_INFORMATION meminfobuf;
+  size_t ret = VirtualQueryEx(child_handle, (void *)address,
+    &meminfobuf, sizeof(MEMORY_BASIC_INFORMATION));
+  if (!ret) return;
+  if (!(meminfobuf.Protect & 0xF0)) return;  // already non-executable
+
+  uint8_t low = meminfobuf.Protect & 0xFF;
+  low = low >> 4;
+  DWORD newProtect = (meminfobuf.Protect & 0xFFFFFF00) + low;
+  DWORD oldProtect;
+  VirtualProtectEx(child_handle, (LPVOID)address, size, newProtect, &oldProtect);
+}
+
 // sets all pages containing (previously detected)
 // code to non-executable
 void Debugger::ProtectCodeRanges(std::list<AddressRange> *executable_ranges) {

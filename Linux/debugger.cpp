@@ -1520,22 +1520,21 @@ void Debugger::ExtractCodeRanges(void *module_base,
 
     if(!(iter->permissions & PROT_EXEC)) continue;
 
-    if(!module_base) {
-      if(iter->addr_to < min_address) continue;
-      if(iter->addr_from > max_address) continue;
-      if(iter->addr_to > max_address) {
-        WARN("Asked to instrument address range that partially overlaps an allocation");
-        iter->addr_to = max_address;
-      }
-      if(iter->addr_from < min_address) {
-        WARN("Asked to instrument address range that partially overlaps an allocation");
-        iter->addr_from = min_address;
-      }
-    }
-    
+    // Clip to [min_address, max_address]. For module-based ranges this
+    // enables partial instrumentation via -instrument_ranges_file.
+    if(iter->addr_to <= min_address) continue;
+    if(iter->addr_from >= max_address) continue;
+
+    size_t region_from = iter->addr_from;
+    size_t region_to = iter->addr_to;
+    if(region_from < min_address) region_from = min_address;
+    if(region_to > max_address) region_to = max_address;
+
     if(do_protect) {
-      int ret = RemoteMprotect((void *)iter->addr_from,
-                               (iter->addr_to - iter->addr_from),
+      // Protect the clipped range, not the full map entry. mprotect
+      // operates at page granularity so the kernel will round outward.
+      int ret = RemoteMprotect((void *)region_from,
+                               (region_to - region_from),
                                iter->permissions ^ PROT_EXEC);
       if(ret) {
         FATAL("Could not apply memory protection");
@@ -1543,8 +1542,8 @@ void Debugger::ExtractCodeRanges(void *module_base,
     }
 
     AddressRange range;
-    range.from = iter->addr_from;
-    range.to = iter->addr_to;
+    range.from = region_from;
+    range.to = region_to;
     range.data = (char *)malloc(range.to - range.from);
     RemoteRead((void *)range.from, range.data, range.to - range.from);
 
@@ -1582,8 +1581,39 @@ void Debugger::ProtectCodeRanges(std::list<AddressRange> *executable_ranges) {
   }
 }
 
+void Debugger::RemoveExecutePermission(size_t address, size_t size) {
+  MapsParser maps_parser;
+  std::vector<MapsEntry> map_entries;
+  maps_parser.Parse(main_pid, map_entries);
+  for (auto &entry : map_entries) {
+    if (address >= entry.addr_from && address < entry.addr_to) {
+      if (!(entry.permissions & PROT_EXEC)) return;  // already non-executable
+      RemoteMprotect((void *)address, size,
+                     entry.permissions ^ PROT_EXEC);
+      return;
+    }
+  }
+}
+
 void Debugger::RestorePagePermissions(void *address) {
-  // Stub for Linux — partial range instrumentation page restoration not yet needed.
+  // Restore execute permission for the single page containing the address.
+  // Used by -instrument_ranges_file when code outside configured ranges
+  // shares a protected page with instrumented code.
+  size_t page_size = getpagesize();
+  size_t page_start = (size_t)address & ~(page_size - 1);
+
+  // Look up current permissions from /proc/[pid]/maps
+  MapsParser maps_parser;
+  std::vector<MapsEntry> map_entries;
+  maps_parser.Parse(main_pid, map_entries);
+  for (auto &entry : map_entries) {
+    if (page_start >= entry.addr_from && page_start < entry.addr_to) {
+      if (entry.permissions & PROT_EXEC) return;  // already executable
+      RemoteMprotect((void *)page_start, page_size,
+                     entry.permissions | PROT_EXEC);
+      return;
+    }
+  }
 }
 
 void Debugger::PatchPointersRemote(void *base_address, std::unordered_map<size_t, size_t>& search_replace) {

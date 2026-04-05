@@ -1021,6 +1021,10 @@ void Debugger::ProtectCodeRanges(std::list<AddressRange> *executable_ranges) {
   }
 }
 
+void Debugger::RemoveExecutePermission(size_t address, size_t size) {
+  RemoteProtect((void *)address, size, READWRITE);
+}
+
 void Debugger::RestorePagePermissions(void *address) {
   // On macOS ARM64, page protection for partial ranges is handled by
   // page-aligning the clipped range, so this is not needed.

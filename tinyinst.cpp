@@ -979,20 +979,10 @@ void TinyInst::InstrumentModule(ModuleInfo *module) {
         module->executable_ranges.push_back(sr);
       }
     }
-    // Now protect the full bounding box in one pass. We call ExtractCodeRanges
-    // again with do_protect=true; its extracted ranges are discarded — we only
-    // want the side-effect of removing execute permission from the pages.
+    // Now protect the extracted ranges by removing execute permission.
     if (module->do_protect) {
-      std::list<AddressRange> discard_ranges;
-      size_t discard_size = 0;
-      ExtractCodeRanges(module->module_header,
-                        module->min_address,
-                        module->max_address,
-                        &discard_ranges,
-                        &discard_size,
-                        true);
-      for (auto &dr : discard_ranges) {
-        free(dr.data);
+      for (auto &er : module->executable_ranges) {
+        RemoveExecutePermission(er.from, er.to - er.from);
       }
     }
     SAY("Multi-range extraction for %s: %zu ranges, total code_size %zu KB\n",

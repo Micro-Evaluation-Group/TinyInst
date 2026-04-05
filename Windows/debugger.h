@@ -129,6 +129,7 @@ protected:
 
   void ProtectCodeRanges(std::list<AddressRange> *executable_ranges);
   void RestorePagePermissions(void *address);
+  void RemoveExecutePermission(size_t address, size_t size);
 
   // returns address in (potentially) instrumented code
   virtual size_t GetTranslatedAddress(size_t address) { return address; }
